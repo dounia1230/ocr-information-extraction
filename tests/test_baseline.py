@@ -6,6 +6,7 @@ import pytest
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import ValidationError
 
+from ocr_information_extraction import pipeline
 from ocr_information_extraction.extraction import extract_regex, normalize_amount, normalize_date
 from ocr_information_extraction.ocr import configure_tesseract
 from ocr_information_extraction.pipeline import process_document
@@ -172,6 +173,23 @@ def test_deskew_restores_horizontal_alignment():
     before = (np.asarray(skewed.convert("L")) < 128).sum(axis=1).max()
     after = (np.asarray(corrected) < 128).sum(axis=1).max()
     assert after > 2 * before
+
+
+def test_svm_explains_when_recognized_text_yields_no_fields(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from ocr_information_extraction.schemas import OCRLine
+
+    path = tmp_path / "unknown.png"
+    Image.new("RGB", (30, 30), "white").save(path)
+    monkeypatch.setattr(pipeline, "recognize", lambda image, **kwargs: [OCRLine(text="UNKNOWN")])
+    monkeypatch.setattr(pipeline, "configure_tesseract", lambda language: "test")
+    classifier = SimpleNamespace(
+        classes_=np.array(["ADDRESS", "COMPANY", "DATE", "OTHER", "TOTAL"]),
+        decision_function=lambda lines: np.array([[-1, -1, -1, 1, -1]]),
+    )
+    result = process_document(path, method="svm", model={"pipeline": classifier})
+    assert "no reliable fields" in result.pages[0].warnings[0]
 
 
 @pytest.fixture

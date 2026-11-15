@@ -3,7 +3,9 @@
 import copy
 import hashlib
 import json
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
@@ -126,6 +128,63 @@ def test_prepare_freezes_before_ocr(local_sroie, tmp_path, monkeypatch):
         prepare_dataset(local_sroie, output)
 
 
+def test_loader_ignores_unrelated_model_metadata(local_sroie):
+    bundled = local_sroie / "layoutlm-base-uncased"
+    bundled.mkdir()
+    (bundled / "config.json").write_text('{"model_type": "layoutlm"}', encoding="utf-8")
+    (bundled / "vocab.txt").write_text("not a receipt transcription", encoding="utf-8")
+    assert len(load_sroie(local_sroie)) == 12
+
+
+def test_loader_reports_windows_1252_transcription(local_sroie, caplog):
+    path = local_sroie / "train/box/receipt-0.txt"
+    path.write_bytes("0,0,100,0,100,20,0,20,PRICE £12.50".encode("cp1252"))
+    documents = load_sroie(local_sroie)
+    doc = next(doc for doc in documents if doc.id == "train/img/receipt-0.jpg")
+    assert doc.reference_text == "PRICE £12.50"
+    assert "Windows-1252" in caplog.text
+
+
+def test_explicit_exclusion_of_incomplete_annotation_is_audited(local_sroie, tmp_path, monkeypatch):
+    annotation = local_sroie / "train/entities/receipt-0.txt"
+    fields = read_json(annotation)
+    del fields["address"]
+    annotation.write_text(json.dumps(fields), encoding="utf-8")
+    with pytest.raises(ValueError, match="must contain"):
+        load_sroie(local_sroie)
+    excluded = ["train/img/receipt-0.jpg"]
+    assert len(load_sroie(local_sroie, exclude_documents=excluded)) == 11
+    monkeypatch.setattr(dataset, "configure_tesseract", lambda language: "test-version")
+    monkeypatch.setattr(dataset, "recognize", lambda image, **kwargs: [OCRLine(text="TEST")])
+    output = tmp_path / "excluded"
+    result = prepare_dataset(local_sroie, output, exclude_documents=excluded)
+    assert result["excluded_documents"] == excluded
+    assert read_json(output / "splits.json")["excluded_documents"] == excluded
+    with pytest.raises(ValueError, match="do not exist"):
+        load_sroie(local_sroie, exclude_documents=["train/img/typo.jpg"])
+
+
+def test_deduplication_preserves_test_and_audits_excluded_copies(
+    local_sroie, tmp_path, monkeypatch
+):
+    test_image = local_sroie / "test/img/receipt-10.jpg"
+    train_image = local_sroie / "train/img/receipt-0.jpg"
+    train_image.write_bytes(test_image.read_bytes())
+    original = train_image.read_bytes()
+    documents = load_sroie(local_sroie, deduplicate=True)
+    assert len(documents) == 11
+    retained = next(doc for doc in documents if doc.id == "test/img/receipt-10.jpg")
+    assert retained.excluded_duplicates == ("train/img/receipt-0.jpg",)
+    assert train_image.read_bytes() == original
+    monkeypatch.setattr(dataset, "configure_tesseract", lambda language: "test-version")
+    monkeypatch.setattr(dataset, "recognize", lambda image, **kwargs: [OCRLine(text="TEST")])
+    output = tmp_path / "deduplicated"
+    result = prepare_dataset(local_sroie, output, deduplicate=True)
+    assert result["excluded_duplicates"] == {"test/img/receipt-10.jpg": ["train/img/receipt-0.jpg"]}
+    assert "train/img/receipt-0.jpg" not in result["documents"]
+    assert read_json(output / "splits.json")["excluded_duplicates"] == result["excluded_duplicates"]
+
+
 def test_annotation_is_never_borrowed_from_other_split(local_sroie):
     (local_sroie / "train/img/receipt-0.jpg").rename(local_sroie / "train/img/receipt-10.jpg")
     with pytest.raises(ValueError, match="Missing field annotation"):
@@ -161,7 +220,8 @@ def test_train_reload_unseen_inference_and_no_test_vocabulary(prepared, tmp_path
     report = train_model(prepared, path)
     bundle = load_model(path)
     assert report["train_lines"] == 40
-    assert "zzzzz" not in bundle["pipeline"].named_steps["tfidf"].vocabulary_
+    vectorizer = dict(bundle["pipeline"].named_steps["features"].transformer_list)["text"]
+    assert "zzzzz" not in vectorizer.vocabulary_
     text = "FRESH MARKET\n15 MAIN STREET\nDate: 13/10/2026\nTOTAL 15.50\nTHANK YOU"
     prediction = extract_svm(text, bundle)
     assert prediction.total == 15.5
@@ -171,6 +231,51 @@ def test_train_reload_unseen_inference_and_no_test_vocabulary(prepared, tmp_path
     assert report["validation_confusion_matrix"]
     with pytest.raises(ValueError, match="Model not found"):
         load_model(tmp_path / "missing.joblib")
+
+
+def test_alignment_excludes_likely_ocr_fields_from_other():
+    fields = {
+        "company": "EXAMPLE MARKET",
+        "address": "12 MAIN STREET TOWN",
+        "date": None,
+        "total": None,
+    }
+    rows = align_lines("EXAMPLE MARKFT\n12 MAIN STRFET\nTOWN\nTHANK YOU", fields)
+    assert [row["label"] for row in rows] == [None, None, None, "OTHER"]
+    assert rows[0]["reason"] == "partial, repeated or noisy annotation match"
+
+
+def test_alignment_excludes_address_below_similarity_threshold():
+    fields = {"company": None, "address": "12 MAIN STREET TOWN", "date": None, "total": None}
+    rows = align_lines("12 MAIN STRFFT\nTOWN", fields)
+    assert all(row["label"] is None for row in rows)
+
+
+def test_alignment_excludes_repeated_approximate_matches():
+    fields = {"company": "EXAMPLE MARKET", "address": None, "date": None, "total": None}
+    rows = align_lines("EXAMPLE MARKFT\nOTHER TEXT\nEXAMPLE MARKFT", fields)
+    assert rows[0]["label"] is None
+    assert rows[2]["label"] is None
+    assert rows[1]["label"] == "OTHER"
+
+
+def test_exact_alignment_outranks_approximate_match_and_ignores_separator():
+    fields = {"company": "EXAMPLE MARKET", "address": None, "date": None, "total": None}
+    rows = align_lines("EXAMPLE MARKET\n---\nEXAMPLE MARKFT", fields)
+    assert rows[0]["label"] == "COMPANY"
+    assert rows[0]["reason"] == "unique normalized annotation match"
+    assert rows[2]["label"] is None
+
+
+def test_alignment_does_not_assign_positive_labels_to_unrelated_text():
+    fields = {
+        "company": "EXAMPLE MARKET",
+        "address": "12 MAIN STREET TOWN",
+        "date": None,
+        "total": None,
+    }
+    rows = align_lines("UNRELATED SHOP\nSOMETHING ELSE\nTHANK YOU", fields)
+    assert not any(row["label"] in {"COMPANY", "ADDRESS"} for row in rows)
 
 
 def test_bad_splits_and_training_class_coverage(prepared, tmp_path):
@@ -189,6 +294,57 @@ def test_corrupt_model_is_actionable(tmp_path):
     path.write_bytes(b"invalid model contents")
     with pytest.raises(ValueError, match="Cannot read trained model"):
         load_model(path)
+
+
+@pytest.mark.parametrize("amount", ["$70", "RM 70.00", "-6.42"])
+def test_svm_total_label_can_precede_value_with_negative_winning_margin(amount):
+    classes = np.array(["ADDRESS", "COMPANY", "DATE", "OTHER", "TOTAL"])
+    scores = np.array([[-2, -2, -2, -0.8, -0.2], [-2, -2, -2, 0.8, -1.0]])
+    pipeline = SimpleNamespace(classes_=classes, decision_function=lambda lines: scores)
+    fields = extract_svm(f"TOTAL:\n{amount}", {"pipeline": pipeline})
+    assert fields.total == (-6.42 if amount.startswith("-") else 70)
+
+
+def test_svm_total_does_not_take_unrelated_following_text():
+    classes = np.array(["ADDRESS", "COMPANY", "DATE", "OTHER", "TOTAL"])
+    scores = np.array([[-2, -2, -2, -0.8, -0.2], [-2, -2, -2, 0.8, -1.0]])
+    pipeline = SimpleNamespace(classes_=classes, decision_function=lambda lines: scores)
+    assert extract_svm("TOTAL:\nCARD # 1234", {"pipeline": pipeline}).total is None
+
+
+def test_svm_selects_strongest_valid_date_and_leaves_tied_values_null():
+    classes = np.array(["ADDRESS", "COMPANY", "DATE", "OTHER", "TOTAL"])
+    scores = np.array([[-2, -2, 0.9, -1, -2], [-2, -2, 0.3, -1, -2]])
+    pipeline = SimpleNamespace(classes_=classes, decision_function=lambda lines: scores)
+    text = "Date 12/10/2026\nReturn before 19/10/2026"
+    assert extract_svm(text, {"pipeline": pipeline}).date == "2026-10-12"
+    scores[1, 2] = 0.9
+    assert extract_svm(text, {"pipeline": pipeline}).date is None
+
+
+def test_svm_does_not_choose_a_field_when_classes_tie():
+    pipeline = SimpleNamespace(
+        classes_=np.array(["ADDRESS", "COMPANY", "DATE", "OTHER", "TOTAL"]),
+        decision_function=lambda lines: np.zeros((len(lines), 5)),
+    )
+    assert all(
+        value is None
+        for value in extract_svm("UNKNOWN TEXT", {"pipeline": pipeline}).model_dump().values()
+    )
+
+
+def test_svm_generalizes_numeric_values_and_currency_without_changing_output(prepared, tmp_path):
+    for doc in prepared["documents"].values():
+        doc["text"] = doc["text"].replace("TOTAL 12.50", "TOTAL RM 12.50")
+    path = tmp_path / "normalized.joblib"
+    train_model(prepared, path)
+    bundle = load_model(path)
+    fields = extract_svm(
+        "FRESH MARKET\n15 MAIN STREET\nDate: 13/10/2035\nTOTAL $15.50\nTHANK YOU",
+        bundle,
+    )
+    assert fields.date == "2035-10-13"
+    assert fields.total == 15.5
 
 
 def test_metrics_wrong_values_and_missing_references():

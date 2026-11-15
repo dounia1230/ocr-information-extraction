@@ -2,14 +2,15 @@
 
 import pickle
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import joblib
 import numpy as np
 import sklearn
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.pipeline import Pipeline
+from sklearn.pipeline import FeatureUnion, Pipeline
 from sklearn.svm import LinearSVC
 
 from .dataset import validate_prepared, write_json
@@ -18,6 +19,7 @@ from .extraction import (
     TOTAL_LABEL,
     amount_in_line,
     clean_lines,
+    normalize_amount,
     normalize_date,
 )
 from .schemas import LABELS, Receipt
@@ -27,8 +29,45 @@ def normalized_text(text: str) -> str:
     return re.sub(r"[^\w]", "", text.casefold())
 
 
+def line_features(lines: list[str]) -> list[str]:
+    """Represent header placement and text shape without depending on specific years or prices."""
+    features = []
+    for index, line in enumerate(lines):
+        text = re.sub(r"\b(?:rm|myr|usd)\b|\$", " currency ", line.casefold())
+        text = re.sub(r"\d+", "0", text)
+        position = f"header{index}" if index < 5 else "body"
+        features.append(f"__{position}__ {' '.join(text.split())}")
+    return features
+
+
+def _text_spans(keys: list[str], target: str) -> tuple[list[tuple[int, int]], set[int]]:
+    """Find exact annotations and exclude noisy near-matches from the OTHER class."""
+    exact = []
+    suspicious = set()
+    for start in range(len(keys)):
+        if not keys[start]:
+            continue
+        joined = ""
+        for end in range(start + 1, len(keys) + 1):
+            joined += keys[end - 1]
+            if not keys[end - 1]:
+                continue
+            if len(joined) > 1.25 * len(target):
+                break
+            if joined == target:
+                exact.append((start, end))
+            elif len(target) >= 6 and len(joined) >= 0.8 * len(target):
+                matcher = SequenceMatcher(None, target, joined, autojunk=False)
+                if matcher.quick_ratio() < 0.8:
+                    continue
+                similarity = matcher.ratio()
+                if similarity >= 0.8:
+                    suspicious.update(range(start, end))
+    return exact, suspicious
+
+
 def align_lines(text: str, fields: dict) -> list[dict]:
-    """Exact normalized spans only. Ambiguous or partial matches are excluded."""
+    """Keep exact normalized labels and exclude ambiguous or likely corrupted field lines."""
     lines = clean_lines(text)
     keys = [normalized_text(line) for line in lines]
     candidates: dict[str, list[tuple[int, int]]] = {label: [] for label in LABELS[:-1]}
@@ -37,13 +76,9 @@ def align_lines(text: str, fields: dict) -> list[dict]:
         target = normalized_text(fields[field] or "")
         if not target:
             continue
-        for start in range(len(lines)):
-            for end in range(start + 1, len(lines) + 1):
-                joined = "".join(keys[start:end])
-                if joined == target:
-                    candidates[field.upper()].append((start, end))
-                if len(joined) >= len(target):
-                    break
+        matches, near_matches = _text_spans(keys, target)
+        suspicious.update(near_matches)
+        candidates[field.upper()].extend(matches)
         # OCR fragments of an unmatched annotated field must not become false OTHER labels.
         for i, key in enumerate(keys):
             if len(key) >= 4 and (key in target or target in key):
@@ -82,7 +117,7 @@ def align_lines(text: str, fields: dict) -> list[dict]:
         elif len(labels) == 1:
             label, reason = labels[0], "unique normalized annotation match"
         elif i in suspicious:
-            label, reason = None, "partial or repeated annotation match"
+            label, reason = None, "partial, repeated or noisy annotation match"
         else:
             label, reason = "OTHER", "no annotation match; manually audit OCR errors"
         records.append({"line": i, "text": line, "label": label, "reason": reason})
@@ -93,8 +128,10 @@ def _examples(prepared: dict, split: str) -> list[dict]:
     records = []
     for doc_id in prepared["splits"][split]:
         doc = prepared["documents"][doc_id]
+        features = line_features(clean_lines(doc["text"]))
         records.extend(
-            {"document": doc_id, **row} for row in align_lines(doc["text"], doc["fields"])
+            {"document": doc_id, **row, "model_text": features[row["line"]]}
+            for row in align_lines(doc["text"], doc["fields"])
         )
     return records
 
@@ -126,7 +163,21 @@ def train_model(prepared: dict, model_path: str | Path, *, c: float = 1.0) -> di
         raise ValueError("No aligned validation lines. Inspect the alignment JSON.")
     pipeline = Pipeline(
         [
-            ("tfidf", TfidfVectorizer(analyzer="char", ngram_range=(2, 5), sublinear_tf=True)),
+            (
+                "features",
+                FeatureUnion(
+                    [
+                        (
+                            "text",
+                            TfidfVectorizer(analyzer="char", ngram_range=(2, 5), sublinear_tf=True),
+                        ),
+                        (
+                            "position",
+                            CountVectorizer(token_pattern=r"__header[0-4]__|__body__", binary=True),
+                        ),
+                    ]
+                ),
+            ),
             (
                 "svm",
                 LinearSVC(
@@ -135,8 +186,8 @@ def train_model(prepared: dict, model_path: str | Path, *, c: float = 1.0) -> di
             ),
         ]
     )
-    pipeline.fit([row["text"] for row in train], [row["label"] for row in train])
-    predicted = pipeline.predict([row["text"] for row in validation])
+    pipeline.fit([row["model_text"] for row in train], [row["label"] for row in train])
+    predicted = pipeline.predict([row["model_text"] for row in validation])
     actual = [row["label"] for row in validation]
     provenance = {
         split: {key: prepared["documents"][key]["fingerprint"] for key in prepared["splits"][split]}
@@ -144,6 +195,8 @@ def train_model(prepared: dict, model_path: str | Path, *, c: float = 1.0) -> di
     }
     bundle = {
         "format_version": 1,
+        "feature_version": 2,
+        "alignment_version": 2,
         "pipeline": pipeline,
         "sklearn_version": sklearn.__version__,
         "provenance": provenance,
@@ -153,6 +206,9 @@ def train_model(prepared: dict, model_path: str | Path, *, c: float = 1.0) -> di
     report = {
         "seed": prepared["seed"],
         "C": c,
+        "feature_version": 2,
+        "alignment_version": 2,
+        "features": "Character TF-IDF of normalized numbers/currencies plus first-five-line position indicators.",
         "train_documents": len(prepared["splits"]["train"]),
         "validation_documents": len(prepared["splits"]["validation"]),
         "train_lines": len(train),
@@ -190,7 +246,21 @@ def load_model(path: str | Path) -> dict:
         raise ValueError(
             "Model scikit-learn version differs. Retrain with the current uv environment."
         )
+    if bundle.get("feature_version", 1) not in {1, 2}:
+        raise ValueError("Unsupported model feature version. Retrain with this application.")
     return bundle
+
+
+def _select_value(candidates: list[tuple[float, str | float | None]]) -> str | float | None:
+    """Choose the strongest valid candidate, leaving exact score ties unresolved."""
+    scores: dict[str | float, float] = {}
+    for score, value in candidates:
+        if value is not None:
+            scores[value] = max(score, scores.get(value, float("-inf")))
+    ranked = sorted(scores, key=scores.__getitem__, reverse=True)
+    if not ranked or (len(ranked) > 1 and scores[ranked[0]] == scores[ranked[1]]):
+        return None
+    return ranked[0]
 
 
 def extract_svm(text: str, bundle: dict) -> Receipt:
@@ -198,14 +268,16 @@ def extract_svm(text: str, bundle: dict) -> Receipt:
     if not lines:
         return Receipt()
     pipeline = bundle["pipeline"]
-    margins = pipeline.decision_function(lines)
+    inputs = line_features(lines) if bundle.get("feature_version", 1) == 2 else lines
+    margins = pipeline.decision_function(inputs)
     predicted = pipeline.classes_[np.argmax(margins, axis=1)]
     scores = np.max(margins, axis=1)
     selected: dict[str, list[tuple[int, str, float]]] = {label: [] for label in LABELS}
     for i, (line, label, score) in enumerate(zip(lines, predicted, scores)):
-        # A negative one-vs-rest margin provides no positive evidence for any field.
-        if score > 0:
-            selected[label].append((i, line, float(score)))
+        # Multiclass prediction uses argmax even when every one-vs-rest score is negative.
+        if np.count_nonzero(margins[i] == score) != 1:
+            continue
+        selected[label].append((i, line, float(score)))
     values = {}
     company = selected["COMPANY"]
     if company:
@@ -221,12 +293,16 @@ def extract_svm(text: str, bundle: dict) -> Receipt:
         while end + 1 in by_index:
             end += 1
         values["address"] = " ".join(by_index[i] for i in range(start, end + 1))
-    dates = {value for _, line, _ in selected["DATE"] if (value := normalize_date(line))}
-    if len(dates) == 1:
-        values["date"] = dates.pop()
-    amounts = {
-        value for _, line, _ in selected["TOTAL"] if (value := amount_in_line(line)) is not None
-    }
-    if len(amounts) == 1:
-        values["total"] = amounts.pop()
+    values["date"] = _select_value(
+        [(score, normalize_date(line)) for _, line, score in selected["DATE"]]
+    )
+    amounts = []
+    for index, line, score in selected["TOTAL"]:
+        value = amount_in_line(line)
+        # Sparse OCR may separate a TOTAL-classified label from its numeric value.
+        if value is None and index + 1 < len(lines):
+            value = normalize_amount(lines[index + 1])
+        if value is not None:
+            amounts.append((score, value))
+    values["total"] = _select_value(amounts)
     return Receipt(**values)

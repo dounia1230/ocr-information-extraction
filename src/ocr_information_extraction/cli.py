@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -37,6 +38,17 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("dataset", type=Path)
     prepare.add_argument("--output", type=Path, default=Path("data/processed"))
     prepare.add_argument("--seed", type=int, default=42)
+    prepare.add_argument(
+        "--deduplicate",
+        action="store_true",
+        help="Keep one copy of identical images, prefer test copies, and audit exclusions",
+    )
+    prepare.add_argument(
+        "--exclude-document",
+        action="append",
+        default=[],
+        help="Exclude an explicit dataset-relative image ID before splitting; repeat as needed",
+    )
     _ocr_arguments(prepare)
     train = commands.add_parser("train", help="Align training lines and fit TF-IDF + LinearSVC")
     train.add_argument("prepared", type=Path, help="prepared.json from prepare")
@@ -85,14 +97,27 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(result.model_dump_json(indent=2))
         elif args.command == "prepare":
+            logging.basicConfig(level=logging.INFO, format="%(message)s")
             prepared = prepare_dataset(
-                args.dataset, args.output, seed=args.seed, language=args.language, psm=args.psm
+                args.dataset,
+                args.output,
+                seed=args.seed,
+                language=args.language,
+                psm=args.psm,
+                deduplicate=args.deduplicate,
+                exclude_documents=args.exclude_document,
             )
             print(
                 f"Saved {len(prepared['documents'])} documents to {args.output / 'prepared.json'}"
             )
             print(json.dumps({key: len(ids) for key, ids in prepared["splits"].items()}))
         elif args.command == "train":
+            if not args.prepared.is_file():
+                raise ValueError(
+                    f"Prepared dataset not found: {args.prepared}. "
+                    f"Run 'ocr-extract prepare <SROIE-directory> --output {args.prepared.parent}' "
+                    "first and wait until preparation completes."
+                )
             report = train_model(read_json(args.prepared), args.model, c=args.c)
             print(f"Saved model to {args.model}; aligned training lines: {report['train_lines']}")
             print(

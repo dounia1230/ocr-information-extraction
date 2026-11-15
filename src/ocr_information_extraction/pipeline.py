@@ -49,6 +49,14 @@ def process_document(
             fields = extract_svm(text, model)
         else:
             fields = extract_regex(text)
+        warnings = []
+        if not text:
+            warnings.append("Tesseract recognized no text on this page.")
+        elif method == "svm" and all(value is None for value in fields.model_dump().values()):
+            warnings.append(
+                "The SVM found no reliable fields in the recognized text. "
+                "It was trained on SROIE receipts; unfamiliar layouts may need additional labeled examples."
+            )
         pages.append(
             PageResult(
                 page=number,
@@ -57,7 +65,7 @@ def process_document(
                 method=method,
                 lines=lines,
                 elapsed_seconds=perf_counter() - page_started,
-                warnings=[] if text else ["Tesseract recognized no text on this page."],
+                warnings=warnings,
             )
         )
     return DocumentResult(

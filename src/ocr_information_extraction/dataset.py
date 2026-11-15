@@ -2,8 +2,9 @@
 
 import hashlib
 import json
+import logging
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter
 
@@ -11,6 +12,8 @@ from .extraction import normalize_amount, normalize_date
 from .ocr import configure_tesseract, recognize
 from .preprocessing import document_pages
 from .schemas import FIELDS, Receipt
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -21,6 +24,7 @@ class SROIEDocument:
     fields: Receipt
     reference_text: str | None
     official_split: str | None
+    excluded_duplicates: tuple[str, ...] = ()
 
 
 def read_json(path: str | Path) -> dict:
@@ -65,22 +69,37 @@ def _pair(image: Path, candidates: list[Path], root: Path) -> Path | None:
     return best[0]
 
 
-def load_sroie(root: str | Path) -> list[SROIEDocument]:
+def load_sroie(
+    root: str | Path,
+    *,
+    deduplicate: bool = False,
+    exclude_documents: list[str] | None = None,
+) -> list[SROIEDocument]:
     root = Path(root).resolve()
     if not root.is_dir():
         raise ValueError(f"SROIE directory does not exist: {root}")
-    images = []
+    files = sorted(path for path in root.rglob("*") if path.is_file())
+    images = [path for path in files if path.suffix.lower() in {".jpg", ".jpeg", ".png"}]
+    excluded = set(exclude_documents or [])
+    missing = excluded - {path.relative_to(root).as_posix() for path in images}
+    if missing:
+        raise ValueError(f"Excluded document IDs do not exist: {sorted(missing)}")
+    images = [path for path in images if path.relative_to(root).as_posix() not in excluded]
+    image_stems = {path.stem.lower() for path in images}
     entities: dict[str, list[Path]] = {}
     boxes: dict[str, list[Path]] = {}
     raw_fields = {}
     references = {}
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() in {".jpg", ".jpeg", ".png"}:
-            images.append(path)
-        elif path.suffix.lower() in {".txt", ".json"}:
-            text = path.read_text(encoding="utf-8-sig").strip()
+    for path in files:
+        # Bundled tokenizer/model metadata is not a receipt annotation.
+        if path.stem.lower() in image_stems and path.suffix.lower() in {".txt", ".json"}:
+            raw = path.read_bytes()
+            try:
+                text = raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text = raw.decode("cp1252")
+                logger.warning("Reading Windows-1252 annotation: %s", path)
+            text = text.strip()
             if text.startswith("{"):
                 try:
                     value = json.loads(text)
@@ -125,7 +144,7 @@ def load_sroie(root: str | Path) -> list[SROIEDocument]:
             if raw[field] not in (None, "") and getattr(fields, field) is None:
                 raise ValueError(f"Cannot normalize {field}={raw[field]!r} in {annotation}.")
         fingerprint = hashlib.sha256(image.read_bytes()).hexdigest()
-        if fingerprint in seen:
+        if fingerprint in seen and not deduplicate:
             raise ValueError(
                 f"Duplicate image content: {image} and {seen[fingerprint]}; remove duplicates before splitting."
             )
@@ -141,6 +160,17 @@ def load_sroie(root: str | Path) -> list[SROIEDocument]:
                 official_split=_official_split(image.relative_to(root)),
             )
         )
+    if deduplicate:
+        groups: dict[str, list[SROIEDocument]] = {}
+        for doc in documents:
+            groups.setdefault(doc.fingerprint, []).append(doc)
+        documents = []
+        for group in groups.values():
+            group.sort(key=lambda doc: (doc.official_split != "test", doc.id))
+            documents.append(
+                replace(group[0], excluded_duplicates=tuple(doc.id for doc in group[1:]))
+            )
+        documents.sort(key=lambda doc: doc.id)
     return documents
 
 
@@ -166,16 +196,26 @@ def split_documents(documents: list[SROIEDocument], seed: int = 42) -> dict[str,
 
 
 def prepare_dataset(
-    root: str | Path, output: str | Path, *, seed: int = 42, language: str = "eng", psm: int = 6
+    root: str | Path,
+    output: str | Path,
+    *,
+    seed: int = 42,
+    language: str = "eng",
+    psm: int = 6,
+    deduplicate: bool = False,
+    exclude_documents: list[str] | None = None,
 ) -> dict:
     output = Path(output)
     if (output / "splits.json").exists() or (output / "prepared.json").exists():
         raise ValueError(
             "Preparation already exists. Choose a new output directory to preserve the frozen split."
         )
-    documents = load_sroie(root)
+    documents = load_sroie(root, deduplicate=deduplicate, exclude_documents=exclude_documents)
     splits = split_documents(documents, seed)
     version = configure_tesseract(language)
+    excluded = {
+        doc.id: list(doc.excluded_duplicates) for doc in documents if doc.excluded_duplicates
+    }
     # Freeze document membership before OCR or line-label generation.
     write_json(
         output / "splits.json",
@@ -183,6 +223,8 @@ def prepare_dataset(
             "seed": seed,
             "splits": splits,
             "fingerprints": {doc.id: doc.fingerprint for doc in documents},
+            "excluded_duplicates": excluded,
+            "excluded_documents": sorted(set(exclude_documents or [])),
         },
     )
     prepared = {
@@ -191,8 +233,18 @@ def prepare_dataset(
         "splits": splits,
         "ocr_config": {"language": language, "psm": psm, "tesseract_version": version},
         "documents": {},
+        "excluded_duplicates": excluded,
+        "excluded_documents": sorted(set(exclude_documents or [])),
     }
-    for doc in documents:
+    logger.info(
+        "Preparing %s documents; splits: %s; excluded duplicate copies: %s",
+        len(documents),
+        {key: len(ids) for key, ids in splits.items()},
+        sum(len(ids) for ids in excluded.values()),
+    )
+    for index, doc in enumerate(documents, start=1):
+        if index == 1 or index % 25 == 0 or index == len(documents):
+            logger.info("OCR %s/%s: %s", index, len(documents), doc.id)
         started = perf_counter()
         image = next(document_pages(doc.image))
         lines = recognize(image, language=language, psm=psm)

@@ -24,7 +24,15 @@ def test_cli_help(capsys):
     assert "prepare" in capsys.readouterr().out
 
 
-def test_streamlit_initial_view():
+def test_training_without_preparation_explains_required_command(capsys, tmp_path):
+    assert main(["train", str(tmp_path / "prepared.json")]) == 1
+    error = capsys.readouterr().err
+    assert "Prepared dataset not found" in error
+    assert "ocr-extract prepare" in error
+
+
+def test_streamlit_initial_view(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py").run(timeout=30)
     assert not app.exception
     assert app.title[0].value == "Receipt OCR & information extraction"
