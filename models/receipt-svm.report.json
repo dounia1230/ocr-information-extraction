@@ -1,0 +1,186 @@
+{
+  "seed": 42,
+  "C": 0.5,
+  "feature_version": 2,
+  "alignment_version": 2,
+  "features": "Character TF-IDF of normalized numbers/currencies plus first-five-line position indicators.",
+  "train_documents": 521,
+  "validation_documents": 92,
+  "train_lines": 13314,
+  "excluded_train_lines": 2158,
+  "validation_line_classification": {
+    "COMPANY": {
+      "precision": 0.868421052631579,
+      "recall": 0.8461538461538461,
+      "f1-score": 0.8571428571428571,
+      "support": 39.0
+    },
+    "DATE": {
+      "precision": 0.8552631578947368,
+      "recall": 0.9701492537313433,
+      "f1-score": 0.9090909090909091,
+      "support": 67.0
+    },
+    "ADDRESS": {
+      "precision": 0.9646017699115044,
+      "recall": 0.9478260869565217,
+      "f1-score": 0.956140350877193,
+      "support": 115.0
+    },
+    "TOTAL": {
+      "precision": 0.6,
+      "recall": 0.7636363636363637,
+      "f1-score": 0.672,
+      "support": 55.0
+    },
+    "OTHER": {
+      "precision": 0.987012987012987,
+      "recall": 0.9771428571428571,
+      "f1-score": 0.9820531227566404,
+      "support": 2100.0
+    },
+    "accuracy": 0.9684343434343434,
+    "macro avg": {
+      "precision": 0.8550597934901616,
+      "recall": 0.9009816815241865,
+      "f1-score": 0.8752854479735198,
+      "support": 2376.0
+    },
+    "weighted avg": {
+      "precision": 0.9713078825331121,
+      "recall": 0.9684343434343434,
+      "f1-score": 0.9695140406050018,
+      "support": 2376.0
+    }
+  },
+  "confusion_matrix_labels": [
+    "COMPANY",
+    "DATE",
+    "ADDRESS",
+    "TOTAL",
+    "OTHER"
+  ],
+  "validation_confusion_matrix": [
+    [
+      33,
+      0,
+      0,
+      0,
+      6
+    ],
+    [
+      0,
+      65,
+      0,
+      0,
+      2
+    ],
+    [
+      0,
+      0,
+      109,
+      0,
+      6
+    ],
+    [
+      0,
+      0,
+      0,
+      42,
+      13
+    ],
+    [
+      5,
+      11,
+      4,
+      28,
+      2052
+    ]
+  ],
+  "note": "Scores use automatically aligned validation lines, not independent manual line labels. Evaluate final fields separately.",
+  "selection": {
+    "split": "validation",
+    "C_candidates": [
+      0.1,
+      0.5,
+      1.0,
+      2.0
+    ],
+    "selected_C": 0.5,
+    "mean_field_f1": 0.5527348279726279,
+    "mean_field_exact_match": 0.4972826086956522,
+    "previous_mean_field_f1": 0.5544014863305724,
+    "previous_mean_field_exact_match": 0.48641304347826086,
+    "tradeoff": "Higher normalized field exact match, slightly lower mean field F1.",
+    "uploaded_receipts_used_for_training": false
+  },
+  "artifact": {
+    "filename": "receipt-svm.joblib",
+    "bytes": 6722520,
+    "sha256": "d000f781382e556855bc18fdbb9f6a5e233fb6c606ca64811d5f8bb8b379a813",
+    "libraries": {
+      "scikit-learn": "1.9.1",
+      "numpy": "2.4.6",
+      "joblib": "1.6.0"
+    }
+  },
+  "held_out_evaluation": {
+    "split": "test",
+    "documents": 344,
+    "image_variant": "original",
+    "ocr_config": {
+      "language": "eng",
+      "psm": 6,
+      "tesseract_version": "5.4.0.20240606"
+    },
+    "ocr": {
+      "cer": 0.23815605264659284,
+      "wer": 0.4727231109641649,
+      "reference_documents": 344
+    },
+    "fields": {
+      "company": {
+        "precision": 0.37446808510638296,
+        "recall": 0.2558139534883721,
+        "f1": 0.30397236614853196,
+        "exact_match": 0.2558139534883721,
+        "support": 344,
+        "true_positives": 88,
+        "false_positives": 147,
+        "false_negatives": 256
+      },
+      "date": {
+        "precision": 0.9205776173285198,
+        "recall": 0.7412790697674418,
+        "f1": 0.821256038647343,
+        "exact_match": 0.7412790697674418,
+        "support": 344,
+        "true_positives": 255,
+        "false_positives": 22,
+        "false_negatives": 89
+      },
+      "address": {
+        "precision": 0.26666666666666666,
+        "recall": 0.2558139534883721,
+        "f1": 0.26112759643916916,
+        "exact_match": 0.2558139534883721,
+        "support": 344,
+        "true_positives": 88,
+        "false_positives": 242,
+        "false_negatives": 256
+      },
+      "total": {
+        "precision": 0.7878787878787878,
+        "recall": 0.6046511627906976,
+        "f1": 0.6842105263157895,
+        "exact_match": 0.6046511627906976,
+        "support": 344,
+        "true_positives": 208,
+        "false_positives": 56,
+        "false_negatives": 136
+      }
+    },
+    "mean_field_f1": 0.5176416318877084,
+    "mean_field_exact_match": 0.4643895348837209
+  }
+}
