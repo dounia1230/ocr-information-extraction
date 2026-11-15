@@ -1,0 +1,36 @@
+[project]
+name = "ocr-information-extraction"
+version = "0.1.0"
+description = "CPU receipt OCR, Regex and supervised SVM information extraction"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pillow>=10.4",
+    "pymupdf>=1.24.10,<2",
+    "opencv-python-headless>=4.10,<5",
+    "numpy>=1.26",
+    "pytesseract>=0.3.13",
+    "pydantic>=2.9,<3",
+    "scikit-learn>=1.5",
+    "joblib>=1.4",
+    "jiwer>=4.0",
+    "streamlit>=1.40",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.9"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+ocr-extract = "ocr_information_extraction.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: requires a working local Tesseract installation"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
