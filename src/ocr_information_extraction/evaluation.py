@@ -131,7 +131,7 @@ def evaluate_dataset(
         },
         "ocr_config": config,
         "definitions": {
-            "field_match": "Text: casefold and collapse whitespace, preserve punctuation. Dates: ISO, numeric day-first. Totals: numeric value.",
+            "field_match": "Text: casefold and collapse whitespace, preserve punctuation. Dates: ISO, numeric day-first when ambiguous; month-first if day-first is invalid. Totals: numeric value.",
             "precision_recall": "TP=correct non-null field; wrong non-null adds FP, and FN if truth exists. Zero denominator gives 0.",
             "exact_match": "Fraction of documents matching per field, including null/null.",
             "ocr": "Corpus CER/WER; casefold and collapse whitespace; punctuation retained; transcription file row order.",

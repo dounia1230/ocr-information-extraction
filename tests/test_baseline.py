@@ -23,6 +23,17 @@ from ocr_information_extraction.schemas import DocumentResult, Receipt
         ("Date: 12/10/2026", "2026-10-12"),
         ("2026.10.12", "2026-10-12"),
         ("12-Oct-26", "2026-10-12"),
+        ("DATE: 03/18/2026 TIME: 10:52:41 PM", "2026-03-18"),
+        ("03-18-26", "2026-03-18"),
+        ("03/04/2026", "2026-04-03"),
+        ("02/29/2024", "2024-02-29"),
+        ("02/29/2025", None),
+        ("20180304", "2018-03-04"),
+        ("25032018", "2018-03-25"),
+        ("Date: 20180428", "2018-04-28"),
+        ("OCT 3, 2016", "2016-10-03"),
+        ("Receipt no: 20180304", None),
+        ("Phone: 25032018", None),
         ("31/02/2026", None),
         ("absent", None),
     ],
@@ -39,7 +50,9 @@ def test_dates(text, expected):
         ("12,50", 12.5),
         ("1 250.50", 1250.5),
         ("0.00", 0),
-        ("-12.00", None),
+        ("-12.00", -12),
+        ("RM -1,250.50", -1250.5),
+        ("--12.00", None),
         ("NaN", None),
         ("1,2,345", None),
         ("12,34.50", None),
@@ -68,10 +81,43 @@ def test_receipt_rules_and_ambiguity():
 
 
 def test_schema_rejects_invalid_fields():
-    for values in ({"total": float("inf")}, {"total": -1}, {"total": True}, {"date": "yesterday"}):
+    for values in (
+        {"total": float("inf")},
+        {"total": float("nan")},
+        {"total": True},
+        {"date": "yesterday"},
+    ):
         with pytest.raises(ValidationError):
             Receipt(**values)
     assert Receipt(company="  ").company is None
+
+
+@pytest.mark.parametrize("amount", ["-1.73", "- 1.73"])
+def test_adjustment_receipt_preserves_negative_total(amount):
+    fields = extract_regex(f"GARDENIA BAKERIES\nTotal 0% supplies: 12.98\nTotal Payable: {amount}")
+    assert fields.total == -1.73
+    assert Receipt.model_validate_json(fields.model_dump_json()).total == -1.73
+
+
+@pytest.mark.parametrize("company", ["HEALTH PHARMACY", "PLAZA PHARMACY"])
+def test_pharmacy_receipt_date_and_multiline_address(company):
+    fields = extract_regex(
+        f"{company}\n456 Medical Plaza\nHealthtown, USA 67890\n"
+        "(555) 987-6543\nDATE: 03/18/2026 TIME: 10:52:41 PM\n"
+        "RX# 12345678\nSUBTOTAL $21.98\nTOTAL $21.98\nPAYMENT VISA"
+    )
+    assert fields == Receipt(
+        company=company,
+        date="2026-03-18",
+        address="456 Medical Plaza Healthtown, USA 67890",
+        total=21.98,
+    )
+
+
+@pytest.mark.parametrize("metadata", ["RX# 12345", "PATIENT: PERSON 12345", "TEL: 12345"])
+def test_address_does_not_capture_metadata_with_five_digit_numbers(metadata):
+    fields = extract_regex(f"ABC STORE\n12 MAIN STREET\n{metadata}\nTOTAL 10.00")
+    assert fields.address == "12 MAIN STREET"
 
 
 def test_image_input_and_preprocessing_preserve_original():

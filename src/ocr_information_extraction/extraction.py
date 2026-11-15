@@ -9,9 +9,10 @@ from .schemas import Receipt
 
 DATE_PATTERN = re.compile(
     r"\b(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.](?:\d{4}|\d{2})"
-    r"|\d{1,2}[- /][A-Za-z]{3,9}[- /](?:\d{4}|\d{2}))\b"
+    r"|\d{1,2}[- /][A-Za-z]{3,9}[- /](?:\d{4}|\d{2})"
+    r"|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b"
 )
-AMOUNT_PATTERN = re.compile(r"(?<![\w./-])\d+(?:[ .,]\d{3})*[.,]\d{2}(?!\d)")
+AMOUNT_PATTERN = re.compile(r"(?<![\w./-])(?:-\s*)?\d+(?:[ .,]\d{3})*[.,]\d{2}(?!\d)")
 TOTAL_LABEL = re.compile(
     r"\b(?:(?:grand|net)\s+total|total(?:\s+(?:due|payable))?|amount\s+due)\b", re.IGNORECASE
 )
@@ -20,9 +21,11 @@ EXCLUDED_TOTAL = re.compile(
 )
 ADDRESS_HINT = re.compile(
     r"\b(street|st\.?|road|rd\.?|jalan|jln\.?|lorong|taman|avenue|ave|lot|floor|"
-    r"suite|block|no\.?|selangor|kuala\s+lumpur)\b",
+    r"suite|block|no\.?|selangor|kuala\s+lumpur)\b"
+    r"|^\d+[A-Za-z]?\s+.*\bplaza\b",
     re.IGNORECASE,
 )
+POSTAL_LINE = re.compile(r"^(?:\d{5}\b|[A-Za-z][A-Za-z .,'-]*\s+\d{5}(?:-\d{4})?$)")
 NON_COMPANY = re.compile(
     r"\b(receipt|invoice|date|tel|phone|fax|cashier|welcome|thank|registration|gst|sst|reg)\b",
     re.IGNORECASE,
@@ -34,12 +37,32 @@ def clean_lines(text: str) -> list[str]:
 
 
 def normalize_date(text: str) -> str | None:
-    match = DATE_PATTERN.search(text)
-    if not match:
-        return None
-    value = re.sub(r"[-/. ]", "-", match.group())
-    # Numeric dates are day-first, as in SROIE; document this locale assumption.
-    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d-%m-%y", "%d-%b-%Y", "%d-%B-%Y", "%d-%b-%y"):
+    # Prefer SROIE's day-first convention; try month-first only when that is invalid.
+    formats = (
+        "%Y-%m-%d",
+        "%d-%m-%Y",
+        "%d-%m-%y",
+        "%d-%b-%Y",
+        "%d-%B-%Y",
+        "%d-%b-%y",
+        "%m-%d-%Y",
+        "%m-%d-%y",
+        "%b-%d-%Y",
+        "%B-%d-%Y",
+    )
+    # Restrict compact dates to whole values or explicitly date-labeled text.
+    compact = re.fullmatch(r"\d{8}", text.strip()) or re.search(
+        r"\bdate\s*[:=]?\s*(\d{8})\b", text, re.IGNORECASE
+    )
+    if compact:
+        value = compact.group(1) if compact.lastindex else compact.group()
+        formats = ("%Y%m%d", "%d%m%Y")
+    else:
+        match = DATE_PATTERN.search(text)
+        if not match:
+            return None
+        value = re.sub(r"[-/.,\s]+", "-", match.group())
+    for fmt in formats:
         try:
             return datetime.strptime(value, fmt).date().isoformat()
         except ValueError:
@@ -53,6 +76,8 @@ def normalize_amount(value: str | float | None) -> float | None:
     text = str(value).strip()
     text = re.sub(r"^(?:RM|MYR|MAD|USD|EUR|\$)\s*", "", text, flags=re.IGNORECASE)
     text = text.replace(" ", "")
+    negative = text.startswith("-")
+    text = text.removeprefix("-")
     if not re.fullmatch(r"\d+(?:[.,]\d+)*", text):
         return None
     if "." in text and "," in text:
@@ -73,9 +98,9 @@ def normalize_amount(value: str | float | None) -> float | None:
         amount = Decimal(text)
     except InvalidOperation:
         return None
-    if not amount.is_finite() or amount < 0 or amount.as_tuple().exponent < -2:
+    if not amount.is_finite() or amount.as_tuple().exponent < -2:
         return None
-    result = float(amount)
+    result = -float(amount) if negative else float(amount)
     return result if isfinite(result) else None
 
 
@@ -127,7 +152,7 @@ def extract_regex(text: str) -> Receipt:
             address.append(line)
             for continuation in lines[index + 1 : index + 3]:
                 if (
-                    ADDRESS_HINT.search(continuation) or re.match(r"^\d{5}\b", continuation)
+                    ADDRESS_HINT.search(continuation) or POSTAL_LINE.match(continuation)
                 ) and not NON_COMPANY.search(continuation):
                     address.append(continuation)
                 else:

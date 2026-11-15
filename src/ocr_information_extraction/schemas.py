@@ -15,7 +15,7 @@ class Receipt(BaseModel):
     company: str | None = None
     date: str | None = None
     address: str | None = None
-    total: float | None = Field(default=None, ge=0, strict=True)
+    total: float | None = Field(default=None, strict=True)
 
     @field_validator("company", "address")
     @classmethod
