@@ -9,6 +9,9 @@ data/
 models/*
 !models/receipt-svm.joblib
 !models/receipt-svm.report.json
+!models/receipt-svm-general.joblib
+!models/receipt-svm-general.report.json
+!models/svm-stages.report.json
 !models/README.md
 outputs/
 .streamlit/secrets.toml
