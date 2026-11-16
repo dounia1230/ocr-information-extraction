@@ -46,7 +46,15 @@ def process_document(
         if method == "svm":
             from .ml import extract_svm
 
-            fields = extract_svm(text, model)
+            fields = extract_svm(
+                text,
+                model,
+                document={
+                    "text": text,
+                    "lines": [line.model_dump() for line in lines],
+                    "image_size": list(processed.size),
+                },
+            )
         else:
             fields = extract_regex(text)
         warnings = []
@@ -55,7 +63,7 @@ def process_document(
         elif method == "svm" and all(value is None for value in fields.model_dump().values()):
             warnings.append(
                 "The SVM found no reliable fields in the recognized text. "
-                "It was trained on SROIE receipts; unfamiliar layouts may need additional labeled examples."
+                "Unfamiliar layouts may need additional labeled training examples."
             )
         pages.append(
             PageResult(

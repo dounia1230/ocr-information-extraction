@@ -28,15 +28,33 @@ def normalize_field(field: str, value):
     return re.sub(r"\s+", " ", str(value)).strip().casefold()
 
 
-def field_metrics(truth: list[dict], predictions: list[dict]) -> dict:
+def field_metrics(
+    truth: list[dict],
+    predictions: list[dict],
+    *,
+    evaluated_fields: list[list[str]] | None = None,
+    text_match: list[str] | None = None,
+) -> dict:
     if len(truth) != len(predictions) or not truth:
         raise ValueError("Metrics require nonempty, equally sized truth and prediction lists.")
+    evaluated_fields = evaluated_fields if evaluated_fields is not None else [FIELDS] * len(truth)
+    text_match = text_match if text_match is not None else ["standard"] * len(truth)
+    if len(evaluated_fields) != len(truth) or len(text_match) != len(truth):
+        raise ValueError("Evaluation masks must match the number of documents.")
     results = {}
     for field in FIELDS:
-        tp = fp = fn = exact = support = 0
-        for expected, predicted in zip(truth, predictions):
+        tp = fp = fn = exact = support = evaluated = 0
+        for expected, predicted, mask, matching in zip(
+            truth, predictions, evaluated_fields, text_match
+        ):
+            if field not in mask:
+                continue
+            evaluated += 1
             actual = normalize_field(field, expected[field])
             guess = normalize_field(field, predicted[field])
+            if matching == "compact" and field in {"company", "address"}:
+                actual = re.sub(r"\s+", "", actual) if actual is not None else None
+                guess = re.sub(r"\s+", "", guess) if guess is not None else None
             same = actual == guess
             exact += same
             support += actual is not None
@@ -49,7 +67,8 @@ def field_metrics(truth: list[dict], predictions: list[dict]) -> dict:
             "precision": precision,
             "recall": recall,
             "f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0,
-            "exact_match": exact / len(truth),
+            "exact_match": exact / evaluated if evaluated else 0.0,
+            "evaluated_documents": evaluated,
             "support": support,
             "true_positives": tp,
             "false_positives": fp,
@@ -80,6 +99,85 @@ def ocr_metrics(references: list[str | None], hypotheses: list[str]) -> dict:
     }
 
 
+def check_model_splits(prepared: dict, model: dict, *, require_membership: bool = True) -> None:
+    provenance = model["provenance"]
+    all_hashes = [value for split in provenance.values() for value in split.values()]
+    if len(set(all_hashes)) != len(all_hashes):
+        raise ValueError("Model provenance contains duplicate documents across splits.")
+    for split in ("train", "validation", "test"):
+        for key in prepared["splits"][split]:
+            fingerprint = prepared["documents"][key]["fingerprint"]
+            if require_membership and provenance[split].get(key) != fingerprint:
+                raise ValueError(
+                    "Model and evaluation document splits differ. Use the frozen training dataset."
+                )
+    if model["ocr_config"] != prepared["ocr_config"]:
+        raise ValueError("Model and prepared OCR configurations differ.")
+
+
+def evaluate_cached(
+    prepared: dict, model: dict | None = None, *, split: str = "validation"
+) -> dict:
+    """Compare extraction on fixed OCR, including disjoint external transfer tests."""
+    validate_prepared(prepared)
+    if split not in {"validation", "test"}:
+        raise ValueError("Cached comparisons require validation or test documents.")
+    ids = prepared["splits"][split]
+    if model is not None:
+        check_model_splits(prepared, model, require_membership=False)
+        forbidden = set(model["provenance"]["train"].values())
+        forbidden.update(model["provenance"]["validation" if split == "test" else "test"].values())
+        if any(prepared["documents"][key]["fingerprint"] in forbidden for key in ids):
+            raise ValueError(
+                "Evaluation leakage: a scored document was used for training or tuning."
+            )
+    documents = [prepared["documents"][key] for key in ids]
+    predictions, timings = [], []
+    for doc in documents:
+        started = perf_counter()
+        receipt = (
+            extract_regex(doc["text"])
+            if model is None
+            else extract_svm(doc["text"], model, document=doc)
+        )
+        timings.append(perf_counter() - started)
+        predictions.append(receipt.model_dump())
+
+    def summarize(indices):
+        selected = [documents[i] for i in indices]
+        fields = field_metrics(
+            [doc["fields"] for doc in selected],
+            [predictions[i] for i in indices],
+            evaluated_fields=[doc.get("evaluated_fields", FIELDS) for doc in selected],
+            text_match=[doc.get("text_match", "standard") for doc in selected],
+        )
+        return {
+            "documents": len(selected),
+            "fields": fields,
+            "macro_f1": mean(score["f1"] for score in fields.values()),
+            "mean_extraction_seconds": mean(timings[i] for i in indices),
+            "mean_cached_ocr_seconds": mean(doc["ocr_elapsed_seconds"] for doc in selected),
+        }
+
+    result = summarize(list(range(len(ids))))
+    result["sources"] = {
+        source: summarize(
+            [i for i, doc in enumerate(documents) if doc.get("source", "sroie") == source]
+        )
+        for source in sorted({doc.get("source", "sroie") for doc in documents})
+    }
+    result["predictions"] = [
+        {
+            "document": key,
+            "expected": doc["fields"],
+            "predicted": prediction,
+            "evaluated_fields": doc.get("evaluated_fields", FIELDS),
+        }
+        for key, doc, prediction in zip(ids, documents, predictions)
+    ]
+    return result
+
+
 def evaluate_dataset(
     prepared: dict,
     root: str | Path,
@@ -92,17 +190,7 @@ def evaluate_dataset(
     if not set(variants).issubset({"grayscale", "threshold", "denoise", "deskew"}):
         raise ValueError("Unknown preprocessing experiment.")
     if model is not None:
-        provenance = model["provenance"]
-        for split in ("train", "validation", "test"):
-            actual = {
-                key: prepared["documents"][key]["fingerprint"] for key in prepared["splits"][split]
-            }
-            if provenance[split] != actual:
-                raise ValueError(
-                    "Model and evaluation document splits differ. Use the frozen training dataset."
-                )
-        if model["ocr_config"] != prepared["ocr_config"]:
-            raise ValueError("Model and prepared OCR configurations differ.")
+        check_model_splits(prepared, model)
     root = Path(root).resolve()
     test_ids = prepared["splits"]["test"]
     documents = prepared["documents"]
@@ -147,12 +235,13 @@ def evaluate_dataset(
     truth = [documents[key]["fields"] for key in test_ids]
     references = [documents[key]["reference_text"] for key in test_ids]
     for variant in ["original", *dict.fromkeys(variants)]:
-        texts, ocr_times = [], []
+        texts, ocr_times, ocr_documents = [], [], []
         options = PreprocessOptions(**({variant: True} if variant != "original" else {}))
         for doc_id in test_ids:
             if variant == "original":
                 texts.append(documents[doc_id]["text"])
                 ocr_times.append(documents[doc_id]["ocr_elapsed_seconds"])
+                ocr_documents.append(documents[doc_id])
             else:
                 started = perf_counter()
                 original = next(document_pages(root / doc_id))
@@ -160,6 +249,13 @@ def evaluate_dataset(
                 lines = recognize(processed, language=config["language"], psm=config["psm"])
                 texts.append("\n".join(line.text for line in lines))
                 ocr_times.append(perf_counter() - started)
+                ocr_documents.append(
+                    {
+                        "text": texts[-1],
+                        "lines": [line.model_dump() for line in lines],
+                        "image_size": list(processed.size),
+                    }
+                )
         experiment = {
             "preprocessing": options.to_dict(),
             "ocr": ocr_metrics(references, texts),
@@ -169,7 +265,11 @@ def evaluate_dataset(
             predictions, timings, errors = [], [], []
             for index, text in enumerate(texts):
                 started = perf_counter()
-                fields = extract_regex(text) if method == "regex" else extract_svm(text, model)
+                fields = (
+                    extract_regex(text)
+                    if method == "regex"
+                    else extract_svm(text, model, document=ocr_documents[index])
+                )
                 timings.append(ocr_times[index] + perf_counter() - started)
                 prediction = fields.model_dump()
                 predictions.append(prediction)

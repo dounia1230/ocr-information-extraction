@@ -8,6 +8,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import sklearn
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.pipeline import FeatureUnion, Pipeline
@@ -124,24 +125,38 @@ def align_lines(text: str, fields: dict) -> list[dict]:
     return records
 
 
-def _examples(prepared: dict, split: str) -> list[dict]:
+def _examples(prepared: dict, split: str, *, reference_labels: bool = False) -> list[dict]:
     records = []
     for doc_id in prepared["splits"][split]:
         doc = prepared["documents"][doc_id]
         features = line_features(clean_lines(doc["text"]))
+        if reference_labels:
+            from .layout import reference_line_labels
+
+            aligned = reference_line_labels(doc)
+            aligned = [{**row, "line": row["source_line"]} for row in aligned]
+        else:
+            aligned = align_lines(doc["text"], doc["fields"])
         records.extend(
-            {"document": doc_id, **row, "model_text": features[row["line"]]}
-            for row in align_lines(doc["text"], doc["fields"])
+            {"document": doc_id, **row, "model_text": features[row["line"]]} for row in aligned
         )
     return records
 
 
-def train_model(prepared: dict, model_path: str | Path, *, c: float = 1.0) -> dict:
+def train_model(
+    prepared: dict, model_path: str | Path, *, c: float = 1.0, stage: str = "legacy"
+) -> dict:
+    if stage not in {"legacy", "references", "spatial", "blocks", "calibrated"}:
+        raise ValueError("Unknown training stage.")
+    if stage in {"spatial", "blocks", "calibrated"}:
+        from .spatial import train_spatial
+
+        return train_spatial(prepared, model_path, c=c, stage=stage)
     validate_prepared(prepared)
     if c <= 0:
         raise ValueError("SVM C must be positive.")
-    train_rows = _examples(prepared, "train")
-    validation_rows = _examples(prepared, "validation")
+    train_rows = _examples(prepared, "train", reference_labels=stage == "references")
+    validation_rows = _examples(prepared, "validation", reference_labels=stage == "references")
     model_path = Path(model_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
     write_json(
@@ -195,8 +210,9 @@ def train_model(prepared: dict, model_path: str | Path, *, c: float = 1.0) -> di
     }
     bundle = {
         "format_version": 1,
+        "stage": stage,
         "feature_version": 2,
-        "alignment_version": 2,
+        "alignment_version": 3 if stage == "references" else 2,
         "pipeline": pipeline,
         "sklearn_version": sklearn.__version__,
         "provenance": provenance,
@@ -206,8 +222,9 @@ def train_model(prepared: dict, model_path: str | Path, *, c: float = 1.0) -> di
     report = {
         "seed": prepared["seed"],
         "C": c,
+        "stage": stage,
         "feature_version": 2,
-        "alignment_version": 2,
+        "alignment_version": 3 if stage == "references" else 2,
         "features": "Character TF-IDF of normalized numbers/currencies plus first-five-line position indicators.",
         "train_documents": len(prepared["splits"]["train"]),
         "validation_documents": len(prepared["splits"]["validation"]),
@@ -239,14 +256,14 @@ def load_model(path: str | Path) -> dict:
     if (
         not isinstance(bundle, dict)
         or bundle.get("format_version") != 1
-        or not isinstance(bundle.get("pipeline"), Pipeline)
+        or not isinstance(bundle.get("pipeline"), (Pipeline, CalibratedClassifierCV))
     ):
         raise ValueError("Unsupported model file. Train it with this application.")
     if bundle.get("sklearn_version") != sklearn.__version__:
         raise ValueError(
             "Model scikit-learn version differs. Retrain with the current uv environment."
         )
-    if bundle.get("feature_version", 1) not in {1, 2}:
+    if bundle.get("feature_version", 1) not in {1, 2, 3}:
         raise ValueError("Unsupported model feature version. Retrain with this application.")
     return bundle
 
@@ -263,7 +280,11 @@ def _select_value(candidates: list[tuple[float, str | float | None]]) -> str | f
     return ranked[0]
 
 
-def extract_svm(text: str, bundle: dict) -> Receipt:
+def extract_svm(text: str, bundle: dict, *, document: dict | None = None) -> Receipt:
+    if bundle.get("feature_version") == 3:
+        from .spatial import extract_document
+
+        return extract_document(document or {"text": text}, bundle)
     lines = clean_lines(text)
     if not lines:
         return Receipt()
